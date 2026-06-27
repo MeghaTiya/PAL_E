@@ -1,6 +1,7 @@
 # Flask and web framework
 Flask==2.3.3
 Werkzeug==2.3.7
+Flask-CORS==4.0.0
 
 # HTTP requests for Ollama API
 requests==2.31.0
@@ -26,6 +27,10 @@ scipy==1.11.4
 # For subtitle/transcript parsing
 webvtt-py==0.4.6
 pysrt==1.1.2
+
+# YouTube Download
+yt-dlp>=2023.12.30
+youtube-transcript-api==0.6.2
 
 # Development and testing (optional)
 pytest==7.4.3

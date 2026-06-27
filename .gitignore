@@ -1,0 +1,16 @@
+node_modules/
+__pycache__/
+*.pyc
+.env
+.DS_Store
+uploads/
+question_generator/uploads/
+question_generator/test.mp4
+question_generator/test_video.mp4
+question_generator/test_video.webp
+demo_application/build/
+question_generator/outputs/
+outputs/
+*.mp4
+*.vtt
+*.png

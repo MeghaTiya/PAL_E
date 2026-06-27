@@ -31,17 +31,103 @@ function DataLoader() {
     // Flag to prevent state update after component unmounts
     let ignore = false;
 
-    const initializeData = async () => {
+        const initializeData = async () => {
       try {
-        const res = await fetch(
-          "data/D2-S1_Corln.v.Causn_questions_20250829_081747.json"
-        );
-        const data = await res.json();
+        let indexData = null;
+        try {
+          const indexRes = await fetch("http://localhost:5005/api/lessons_index");
+          if (indexRes.ok) {
+            indexData = await indexRes.json();
+          }
+        } catch (e) {
+          console.log("No custom lessons index found or server offline, loading default data...");
+        }
 
-        // Only process data if the component is still mounted
-        if (!ignore) {
-          // Check if data is already loaded to prevent any race conditions
-          if (lessons.length === 0) {
+        if (!ignore && lessons.length === 0) {
+          if (indexData && indexData.length > 0) {
+            // Load custom dynamic lessons
+            for (const item of indexData) {
+              const qRes = await fetch(`http://localhost:5005/api/questions/${item.questions_file}`);
+              if (!qRes.ok) continue;
+              const qDataRaw = await qRes.json();
+              const questionsData = qDataRaw.questions || qDataRaw;
+              
+              var questions = [];
+              let lastTimestamp = -1;
+              questionsData.forEach((jsonquestion) => {
+                 const seconds = timestampToSeconds(jsonquestion.timestamp);
+                 if (questions.length === 0 || lastTimestamp !== seconds) {
+                   questions.push(new Question(seconds));
+                   lastTimestamp = seconds;
+                 }
+                 const currentQ = questions[questions.length - 1];
+                 let answerText = jsonquestion.question.answer || jsonquestion.question.a || "A";
+                 let options_raw = jsonquestion.question.options || [];
+                 let options = [];
+                 if (options_raw && typeof options_raw === "object" && !Array.isArray(options_raw)) {
+                     options = [
+                         options_raw.a || options_raw.A || "", 
+                         options_raw.b || options_raw.B || "", 
+                         options_raw.c || options_raw.C || "", 
+                         options_raw.d || options_raw.D || ""
+                     ].filter(x => x !== "");
+                 } else if (Array.isArray(options_raw)) {
+                     options = options_raw;
+                 }
+                 
+                 let correctAnswerLetter = "A";
+                 
+                 // If the answer is just a letter "A", "B", "C", "D"
+                 if (["A", "B", "C", "D"].includes(answerText.trim().toUpperCase())) {
+                     correctAnswerLetter = answerText.trim().toUpperCase();
+                 } else {
+                     // The answer is actual text!
+                     if (options.length === 0) {
+                         options = [answerText, "False option 1", "False option 2", "False option 3"];
+                         correctAnswerLetter = "A";
+                     } else {
+                         let idx = options.indexOf(answerText);
+                         if (idx === -1) {
+                             options[0] = answerText;
+                             correctAnswerLetter = "A";
+                         } else {
+                             correctAnswerLetter = ["A", "B", "C", "D"][idx] || "A";
+                         }
+                     }
+                 }
+                 
+                 if (options.length < 4) {
+                   options = [...options, ...Array(4 - options.length).fill("N/A")];
+                 }
+
+                 currentQ.addDifficulty(
+                   jsonquestion.question.text || jsonquestion.question.q || "Generated Question",
+                   options,
+                   correctAnswerLetter,
+                   jsonquestion.question.detailed_answer || jsonquestion.question.explanation || answerText || "No answer",
+                   jsonquestion.difficulty || jsonquestion.question.d || "medium"
+                 );
+              });
+
+              const lessonInstance = new Lesson(
+                item.id,
+                item.title,
+                questions,
+                item.thumbnailFileName,
+                item.vidFidName
+              );
+              addLesson(lessonInstance);
+            }
+          } else {
+            let res;
+            try {
+              res = await fetch("data/custom_lesson.json");
+              if (!res.ok) throw new Error("Not found");
+            } catch (err) {
+              // Fallback to original hardcoded default lesson
+              res = await fetch("data/D2-S1_Corln.v.Causn_questions_20250829_081747.json");
+            }
+            const data = await res.json();
             data.forEach((item) => {
               var questions = [];
               item.questions.forEach((jsonquestion, index) => {
@@ -59,19 +145,6 @@ function DataLoader() {
                     jsonquestion.question.difficulty
                   );
               });
-
-              /*const questions = item.questions.map(
-                (jsonquestion) =>
-                  new Question(
-                    jsonquestion.question.text,
-                    jsonquestion.question.options,
-                    jsonquestion.question.answer,
-                    jsonquestion.question.detailed_answer,
-                    timestampToSeconds(jsonquestion.timestamp),
-                    jsonquestion.difficulty,
-                    jsonquestion.tags
-                  )
-              );*/
               const lessonInstance = new Lesson(
                 item.id,
                 item.title,
@@ -82,7 +155,7 @@ function DataLoader() {
               addLesson(lessonInstance);
             });
           }
-          setIsInitializedReady(true); // Moved inside to run after data is loaded
+          setIsInitializedReady(true);
         }
       } catch (err) {
         console.error("Failed to load lessons:", err);
@@ -108,7 +181,8 @@ function DataLoader() {
         resumeLesson(saved);
       }
     }
-  }, [isInitializedReady, resumeLesson]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isInitializedReady]);
 
   // Save current lesson to localStorage on unload
   useEffect(() => {

@@ -117,7 +117,20 @@ export class LearningAppFascade {
    */
   resumeLesson(lessonId) {
     const lessonList = LessonList.getInstance();
-    this.#currentLesson = lessonList.getLessonFromId(lessonId);
+    let loadedLesson = lessonList.getLessonFromId(lessonId);
+    
+    // If the saved lesson no longer exists (e.g. was a custom upload that got wiped on refresh),
+    // fallback to the first available lesson or a default.
+    if (!loadedLesson) {
+        const lessons = lessonList.getLessons();
+        if (lessons && lessons.length > 0) {
+            loadedLesson = lessons[0];
+        } else {
+            loadedLesson = lessonList.getLesson("D2-S1");
+        }
+    }
+    
+    this.#currentLesson = loadedLesson;
     this.notify();
   }
 
@@ -149,6 +162,6 @@ export class LearningAppFascade {
    * @returns User's summary
    */
   getSummary() {
-    return this.#currentLesson.getSummary();
+    return this.#currentLesson ? this.#currentLesson.getSummary() : "";
   }
 }

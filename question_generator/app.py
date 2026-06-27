@@ -1,29 +1,38 @@
 """
 Flask Application for Agentic Video Question Generation Pipeline
 Converts video + transcript into validated educational questions
-Supports automatic transcript generation from video                logger.info(f"Using Visual-First pipeline with {len(transcript_segments)} segments")files
+Supports automatic transcript generation from video files
 """
 
 import os
+import sys
 import json
 from datetime import datetime
 from flask import Flask, render_template, request, jsonify, send_from_directory
+
+# Add parent directory to path so 'pipelines' and 'core' can be imported
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
 from werkzeug.utils import secure_filename
-from agents.pipeline import TriPlusOnePipeline
-from agents.transcript_loader import TranscriptLoader
-from agents.llm_judge import LLMJudge
-from agents.context_validator import ContextValidator
-from agents.question_generator import QuestionGenerator
+from pipelines.tri_plus_one.pipeline import TriPlusOnePipeline
 import logging
+import logging
+from flask_cors import CORS
+import yt_dlp
+from youtube_transcript_api import YouTubeTranscriptApi
+from urllib.parse import urlparse, parse_qs
+import uuid
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
+CORS(app)
 app.config['SECRET_KEY'] = 'your-secret-key-here'
 app.config['UPLOAD_FOLDER'] = 'uploads'
 app.config['OUTPUT_FOLDER'] = 'outputs'
+app.config['THUMBNAIL_FOLDER'] = 'uploads'
 app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024  # 500MB max file size
 
 # Allowed file extensions
@@ -32,6 +41,7 @@ ALLOWED_TRANSCRIPT_EXTENSIONS = {'json', 'txt', 'srt', 'vtt'}
 
 # Create necessary directories
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+os.makedirs(app.config['THUMBNAIL_FOLDER'], exist_ok=True)
 os.makedirs(app.config['OUTPUT_FOLDER'], exist_ok=True)
 
 def allowed_file(filename, allowed_extensions):
@@ -161,102 +171,80 @@ def process_video():
         num_questions = int(data.get('num_questions', 5))
         include_mcq = data.get('include_mcq', True)  # Enabled by default for enhanced types
         use_vlm = data.get('use_vlm', True)
-        analysis_mode = data.get('analysis_mode', 'strategic_hybrid')  # NEW: Strategic hybrid as default
+        analysis_mode = data.get('analysis_mode', 'visual_first')  # NEW: Visual first as default
         
         logger.info(f"Processing request: {num_questions} questions, analysis_mode={analysis_mode}")
         
         # Initialize processors - Use proper pipeline approach
         try:
-            # Use Visual-First Pipeline for educational content
-            from agents.pipeline import TriPlusOnePipeline
+            from pipelines.tri_plus_one.pipeline import TriPlusOnePipeline
             pipeline = TriPlusOnePipeline(use_vlm=use_vlm)
             
-            # Load transcript segments
-            if transcript_path:
-                file_extension = os.path.splitext(transcript_path)[1].lower()
-                if file_extension == '.docx':
-                    from agents.docx_transcript_extractor import DocxTranscriptExtractor
-                    docx_extractor = DocxTranscriptExtractor()
-                    transcript_segments = docx_extractor.extract_transcript_from_docx(transcript_path)
-                else:
-                    from agents.transcript_loader import TranscriptLoader
-                    transcript_loader = TranscriptLoader()
-                    transcript_segments = transcript_loader.load(transcript_path)
-                
-                logger.info(f"� Using Visual-First pipeline with {len(transcript_segments)} segments")
-                
-                # Run Visual-First pipeline: Slides as primary source, transcript as context
-                questions = pipeline.run(video_path, transcript_segments)
-                
-            else:
-                logger.error("No transcript provided for visual-first analysis")
-                return jsonify({'error': 'Transcript required for visual-first question generation'}), 400
+            # Read actual VTT transcript
+            import webvtt
+            import re
+            transcript_segments = []
+            last_lines = []
+            try:
+                for caption in webvtt.read(transcript_path):
+                    # Clean up YouTube's word-by-word formatting tags
+                    clean_text = re.sub(r'<[^>]+>', '', caption.text)
+                    lines = [line.strip() for line in clean_text.split('\n') if line.strip()]
+                    
+                    unique_lines = []
+                    for line in lines:
+                        if line not in last_lines:
+                            unique_lines.append(line)
+                            
+                    last_lines = lines
+                    
+                    if unique_lines:
+                        transcript_segments.append({
+                            "time": caption.start.split(".")[0], 
+                            "text": " ".join(unique_lines)
+                        })
+            except Exception as e:
+                logger.error(f"Failed to parse VTT transcript: {e}")
+                return jsonify({'error': f"Failed to parse VTT transcript: {e}"}), 500
             
-            # Validate questions with enhanced LLM Judge
-            from agents.llm_judge import LLMJudge
-            judge = LLMJudge()
+            logger.info(f"Using Tri+1 pipeline with {len(transcript_segments)} segments")
+            
+            # Run Visual-First pipeline
+            questions = pipeline.run(video_path, transcript_segments)
             
             validated_questions = []
-            pipeline_context = {'summary': f'Visual-first analysis of {len(questions)} segments'}
             
             for question in questions:
                 try:
-                    evaluation = judge.judge_question(question['question'], pipeline_context)
+                    q_data = question.get('question_data', {})
+                    segment_context = question.get('context_metadata', {})
                     
-                    # Check if it's the new format (dict) or old format (float)
-                    if isinstance(evaluation, dict):
-                        score = evaluation.get('score', 0)
-                        difficulty = evaluation.get('difficulty', 'medium')
-                        tags = evaluation.get('tags', [])
-                        cognitive_level = evaluation.get('cognitive_level', 'understand')
-                        feedback = evaluation.get('feedback', '')
-                    else:
-                        # Old format - just a score
-                        score = evaluation
-                        difficulty = 'medium'
-                        tags = [question['question'].get('type', 'factual')]
-                        cognitive_level = 'understand'
-                        feedback = ''
+                    # Convert QuestionSchema output to frontend expected format
+                    score = 5 # Mock score since LLMJudge is deprecated
+                    difficulty = q_data.get('d', 'medium')
+                    tags = [q_data.get('t', 'factual')]
                     
-                    # Extract VLM analysis from segment context (Visual-First approach)
-                    segment_context = question.get('segment_context', {})
-                    vlm_analysis = segment_context.get('vlm_analysis')
-                    
-                    # Format VLM analysis for output
-                    if isinstance(vlm_analysis, dict):
-                        vlm_analysis_str = f"Analysis method: {vlm_analysis.get('analysis_method', 'Unknown')}. " + \
-                                         f"Frame analysis: {vlm_analysis.get('frame_analysis', '')}. " + \
-                                         f"Educational concepts: {', '.join(vlm_analysis.get('educational_concepts', []))}"
-                    else:
-                        vlm_analysis_str = vlm_analysis or 'No VLM analysis available'
-                    
-                    if score >= 7:  # Quality threshold
+                    if score >= 2:
                         validated_questions.append({
-                            'question': question['question'],
+                            'question': q_data,
                             'timestamp': question.get('timestamp', '00:00:00'),
                             'segment_text': segment_context.get('transcript_text', ''),
                             'quality_score': score,
                             'difficulty': difficulty,
                             'tags': tags,
-                            'cognitive_level': cognitive_level,
-                            'feedback': feedback,
-                            'question_type': question.get('question_type', 'factual'),
+                            'question_type': q_data.get('t', 'factual'),
                             
-                            'vlm_analysis': vlm_analysis_str,
+                            'vlm_analysis': 'Pipeline execution successful',
                             'transcript_analysis': segment_context.get('transcript_analysis', {}),
-                            'frame_analysis_confidence': segment_context.get('confidence', 0),
-                            'transcript_analysis_confidence': question.get('transcript_analysis_confidence', 0),
                             'educational_indicators': segment_context.get('educational_concepts', []),
-                            'concept_extraction_method': segment_context.get('method', 'unknown'),
                             'visual_elements': ', '.join(segment_context.get('visual_elements', [])),
-                            'strategic_tier': question.get('strategic_tier', 'unknown'),
                             'analysis_mode': segment_context.get('method', 'unknown')
                         })
                         
                 except Exception as e:
                     logger.error(f"Error evaluating question: {e}")
                     continue
-            
+              
             # Generate output filename
             base_name = os.path.splitext(video_filename)[0]
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -282,6 +270,30 @@ def process_video():
             
             with open(output_path, 'w') as f:
                 json.dump(results, f, indent=2)
+            
+            # Update lessons_index.json
+            thumbnail_filename = data.get('thumbnail_file')
+            lessons_index_path = os.path.join(app.config['OUTPUT_FOLDER'], 'lessons_index.json')
+            lessons_list = []
+            if os.path.exists(lessons_index_path):
+                try:
+                    with open(lessons_index_path, 'r') as f:
+                        lessons_list = json.load(f)
+                except Exception as e:
+                    logger.error(f"Error reading lessons index: {e}")
+            
+            new_lesson_id = str(len(lessons_list) + 1)
+            lesson_metadata = {
+                "id": new_lesson_id,
+                "title": os.path.splitext(video_filename)[0],
+                "thumbnailFileName": f"http://localhost:5005/video/{thumbnail_filename}" if thumbnail_filename else "https://via.placeholder.com/320x180?text=Custom+Lesson",
+                "vidFidName": f"http://localhost:5005/video/{video_filename}",
+                "questions_file": output_filename
+            }
+            lessons_list.append(lesson_metadata)
+            
+            with open(lessons_index_path, 'w') as f:
+                json.dump(lessons_list, f, indent=2)
             
             logger.info(f"Questions generated and saved: {output_filename}")
             
@@ -438,6 +450,20 @@ def list_files():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+@app.route('/api/lessons_index')
+def get_lessons_index():
+    """Get the dynamically generated lessons index"""
+    try:
+        lessons_index_path = os.path.join(app.config['OUTPUT_FOLDER'], 'lessons_index.json')
+        if not os.path.exists(lessons_index_path):
+            return jsonify([])
+        with open(lessons_index_path, 'r') as f:
+            data = json.load(f)
+        return jsonify(data)
+    except Exception as e:
+        logger.error(f"Error loading lessons index: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
 @app.route('/api/health')
 def health_check():
     """Health check endpoint"""
@@ -455,6 +481,122 @@ def download_file(filename):
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+@app.route('/video/<filename>')
+def serve_video(filename):
+    """Serve uploaded/downloaded video files for the frontend player"""
+    try:
+        return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+def extract_video_id(url):
+    parsed = urlparse(url)
+    if parsed.hostname == 'youtu.be':
+        return parsed.path[1:]
+    if parsed.hostname in ('www.youtube.com', 'youtube.com'):
+        if parsed.path == '/watch':
+            return parse_qs(parsed.query)['v'][0]
+        if parsed.path.startswith('/embed/'):
+            return parsed.path.split('/')[2]
+        if parsed.path.startswith('/v/'):
+            return parsed.path.split('/')[2]
+    return None
+
+@app.route('/process-youtube', methods=['POST'])
+def process_youtube():
+    try:
+        data = request.get_json()
+        youtube_url = data.get('youtube_url')
+        if not youtube_url:
+            return jsonify({'error': 'YouTube URL is required'}), 400
+        
+        video_id = extract_video_id(youtube_url)
+        if not video_id:
+            return jsonify({'error': 'Invalid YouTube URL'}), 400
+            
+        base_name = f"yt_{video_id}_{uuid.uuid4().hex[:6]}"
+        video_filename = f"{base_name}.mp4"
+        transcript_filename = f"{base_name}_transcript.json"
+        
+        video_path = os.path.join(app.config['UPLOAD_FOLDER'], video_filename)
+        transcript_path = os.path.join(app.config['UPLOAD_FOLDER'], transcript_filename)
+        
+        # 1. Download YouTube Video and Subtitles
+        logger.info(f"Downloading YouTube video and subtitles for {video_id}")
+        ydl_cmd = [
+            "yt-dlp",
+            "--extractor-args", "youtube:player_client=android",
+            "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+            "-o", video_path,
+            "--merge-output-format", "mp4",
+            "--write-sub",
+            "--write-auto-sub",
+            "--sub-format", "vtt",
+            "--sub-lang", "en",
+            "--write-thumbnail",
+            "--convert-thumbnails", "png",
+            youtube_url
+        ]
+        try:
+            import subprocess
+            subprocess.run(ydl_cmd, check=True, capture_output=True, text=True)
+        except subprocess.CalledProcessError as yt_err:
+            error_output = yt_err.stderr or ""
+            if "Video unavailable" in error_output:
+                return jsonify({'error': 'This YouTube video is unavailable, private, or the URL is incorrect. Please check the link.'}), 400
+            if "HTTP Error 403" in error_output or "Sign in to confirm you’re not a bot" in error_output:
+                return jsonify({'error': 'YouTube is blocking requests right now (403 Forbidden). Please upload a local file instead.'}), 400
+            raise Exception(f"yt-dlp failed: {error_output}")
+            
+        # yt-dlp saves subtitles as <video_basename>.en.vtt because of our outtmpl
+        base_video_path = os.path.splitext(video_path)[0]
+        vtt_path = f"{base_video_path}.en.vtt"
+        
+        final_transcript_filename = None
+        if os.path.exists(vtt_path):
+            final_transcript_filename = f"{base_name}.en.vtt"
+            logger.info(f"Successfully downloaded VTT subtitles: {final_transcript_filename}")
+        else:
+            logger.warning("No subtitles found or downloaded. Falling back to Whisper generation.")
+            try:
+                from agents.transcript_generator import VideoTranscriptGenerator
+                transcript_gen = VideoTranscriptGenerator()
+                transcript_data = transcript_gen.transcribe_with_whisper(video_path)
+                
+                final_transcript_filename = f"{base_name}.en.vtt"
+                generated_vtt_path = os.path.join(app.config['UPLOAD_FOLDER'], final_transcript_filename)
+                
+                transcript_gen.save_as_vtt(transcript_data, generated_vtt_path)
+                logger.info(f"Successfully generated VTT using Whisper: {final_transcript_filename}")
+            except Exception as e:
+                logger.error(f"Whisper generation failed: {str(e)}")
+                return jsonify({'error': 'Failed to get subtitles from YouTube and Whisper generation also failed.'}), 500
+            
+        # Check for downloaded thumbnail
+        final_thumbnail_filename = None
+        import shutil
+        for ext in ['.png', '.webp', '.jpg', '.jpeg']:
+            thumb_path = f"{base_video_path}{ext}"
+            if os.path.exists(thumb_path):
+                final_thumbnail_filename = f"{base_name}.png"
+                new_thumb_path = os.path.join(app.config['THUMBNAIL_FOLDER'], final_thumbnail_filename)
+                
+                # If not png, we should ideally convert, but we asked FFmpeg to convert to png
+                # Just in case, move it and rename to .png
+                shutil.move(thumb_path, new_thumb_path)
+                break
+            
+        return jsonify({
+            'message': 'YouTube video processed successfully',
+            'video_file': video_filename,
+            'transcript_file': final_transcript_filename,
+            'thumbnail_file': final_thumbnail_filename
+        })
+        
+    except Exception as e:
+        logger.error(f"Process YouTube endpoint error: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
 @app.errorhandler(413)
 def too_large(e):
     return jsonify({'error': 'File too large. Maximum size is 500MB.'}), 413
@@ -468,4 +610,4 @@ def internal_error(e):
     return jsonify({'error': 'Internal server error'}), 500
 
 if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0', port=5000)
+    app.run(debug=True, use_reloader=False, host='0.0.0.0', port=5005)

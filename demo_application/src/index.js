@@ -5,6 +5,7 @@ import Login from "./pages/Login";
 import SignUp from "./pages/SignUp";
 import Start from "./pages/Start";
 import Video from "./pages/Video";
+import Upload from "./pages/Upload";
 import DataLoader from './data_saver/DataLoader';
 import "./stylesheets/index.css";
 
@@ -19,6 +20,7 @@ export default function App() {
           <Route path="/login" element={<Login />} />
           <Route path="/signup" element={<SignUp />} />
           <Route path="/video" element={<Video />} />
+          <Route path="/upload" element={<Upload />} />
         </Routes>
       </BrowserRouter>
     </>
